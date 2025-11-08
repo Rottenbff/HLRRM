@@ -6,7 +6,6 @@ Adapted for conversational question-answering tasks
 import os, shutil, pathlib, random, json, datetime, math
 from typing import Optional
 from dataclasses import dataclass
-import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -15,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from datasets import load_dataset
 from transformers import T5Tokenizer
 from tqdm.auto import tqdm
 
@@ -23,7 +23,7 @@ import wandb
 
 # ----------------------------
 # Training Parameters
-HF_REPO_ID = "YourUsername/HLRRM-Dolly-QA"  # Change this to your HuggingFace repo
+HF_REPO_ID = "HLRRM-Dolly-QA"  # Change this to your HuggingFace repo
 SEED = 42
 NUM_EPOCHS = 3
 BLOCK_SIZE = 512
@@ -94,90 +94,68 @@ print(f"Tokenizer loaded. Vocab size: {len(tokenizer)}; eos={tokenizer.eos_token
 from modeling import HLRRMText1
 
 # ----------------------------
-# Custom Dataset for Dolly Q&A
-class DollyQADataset(Dataset):
-    def __init__(self, csv_path, tokenizer, max_length=512, split="train"):
-        self.data = pd.read_csv(csv_path)
-        
-        # Clean the data
-        self.data = self.data.dropna(subset=['instruction', 'response'])
-        self.data = self.data[self.data['response'].str.strip() != '']
-        self.data = self.data.reset_index(drop=True)
-        
-        # Filter for reasonable lengths
-        max_instruction_length = 256
-        max_response_length = 256
-        self.data = self.data[
-            (self.data['instruction'].str.len() <= max_instruction_length) &
-            (self.data['response'].str.len() <= max_response_length)
-        ].reset_index(drop=True)
-        
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.split = split
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def format_qa(self, instruction, context, response):
-        """Format the question-answer pair for training"""
-        if context and context.strip():
+# Data Loading and Preprocessing
+print("Loading Dolly Q&A dataset from HuggingFace...")
+raw_datasets = load_dataset("databricks/databricks-dolly-15k")
+
+def tokenize_function(examples):
+    """Tokenize Dolly Q&A examples"""
+    questions = []
+    for instruction, context, response in zip(examples['instruction'], examples['context'], examples['response']):
+        # Format the QA pair
+        if context and str(context).strip():
             prompt = f"Question: {instruction}\nContext: {context}\nAnswer:"
         else:
             prompt = f"Question: {instruction}\nAnswer:"
         
-        full_text = f"{prompt} {response}{self.tokenizer.eos_token}"
-        return full_text
+        full_text = f"{prompt} {response}{tokenizer.eos_token}"
+        questions.append(full_text)
     
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        instruction = str(row['instruction']).strip()
-        context = str(row.get('context', '')) if pd.notna(row.get('context')) else ''
-        response = str(row['response']).strip()
-        
-        # Format the QA pair
-        formatted_text = self.format_qa(instruction, context, response)
-        
-        # Tokenize
-        encoding = self.tokenizer(
-            formatted_text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        return {
-            "input_ids": encoding["input_ids"].squeeze(),
-            "attention_mask": encoding["attention_mask"].squeeze(),
-            "labels": encoding["input_ids"].squeeze().clone()  # Same as input for causal LM
-        }
+    # Tokenize
+    tokenized = tokenizer(
+        questions,
+        truncation=True,
+        max_length=BLOCK_SIZE,
+        padding="max_length",
+        add_special_tokens=False,
+    )
+    
+    # Set labels to input_ids for causal language modeling
+    tokenized["labels"] = tokenized["input_ids"].copy()
+    
+    return tokenized
 
-# ----------------------------
-# Data Loading and Preprocessing
-print("Loading Dolly Q&A dataset...")
-dataset_path = "new one.csv"  # Path to your CSV file
-train_dataset = DollyQADataset(dataset_path, tokenizer, BLOCK_SIZE, split="train")
-val_dataset = DollyQADataset(dataset_path, tokenizer, BLOCK_SIZE, split="val")
+# Tokenize the dataset
+print("Tokenizing Dolly dataset...")
+tokenized = raw_datasets.map(
+    tokenize_function,
+    batched=True,
+    num_proc=os.cpu_count(),
+    remove_columns=raw_datasets["train"].column_names,
+)
+tokenized.set_format("torch")
 
-# Create train/val split
-train_size = int(0.9 * len(train_dataset))
-val_size = len(train_dataset) - train_size
+# Create train/validation split
+print("Creating train/validation split...")
+train_size = int(0.9 * len(tokenized["train"]))
+val_size = len(tokenized["train"]) - train_size
 
-# Simple random split for demonstration
-train_indices = list(range(len(train_dataset)))
+# Simple random split
+train_indices = list(range(len(tokenized["train"])))
 random.shuffle(train_indices)
 train_indices = train_indices[:train_size]
 val_indices = train_indices[train_size:]
 
-train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
-val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+train_dataset = torch.utils.data.Subset(tokenized["train"], train_indices)
+val_dataset = torch.utils.data.Subset(tokenized["train"], val_indices)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
 
 print(f"Training samples: {len(train_dataset)}")
 print(f"Validation samples: {len(val_dataset)}")
+print("Dataset loaded successfully!")
+
 
 # --------------------------------
 # Model, Optimizer, Scheduler
@@ -425,6 +403,7 @@ print("Training run finished.")
 def ask_question(question, context=None, model=model, tokenizer=tokenizer, max_new_tokens=100, temperature=0.7, top_k=50):
     """Ask a question to the trained model"""
     model.eval()
+    device = next(model.parameters()).device
     
     if context and context.strip():
         prompt = f"Question: {question}\nContext: {context}\nAnswer:"
@@ -439,29 +418,25 @@ def ask_question(question, context=None, model=model, tokenizer=tokenizer, max_n
             out = model(input_ids, attention_mask=attention_mask)
             next_token_logits = out["logits"][:, -1, :] / max(temperature, 1e-6)
 
-            # Top-K filtering
-            topk_vals, topk_idx = torch.topk(next_token_logits, k=min(top_k, next_token_logits.size(-1)))
-            mask = torch.full_like(next_token_logits, float("-inf"))
-            mask.scatter_(1, topk_idx, topk_vals)
+            if top_k > 0:
+                topk_vals, topk_idx = torch.topk(next_token_logits, k=min(top_k, next_token_logits.size(-1)))
+                mask = torch.full_like(next_token_logits, float("-inf"))
+                mask.scatter_(1, topk_idx, topk_vals)
+                next_token_logits = mask
 
-            probs = F.softmax(mask, dim=-1)
+            probs = F.softmax(next_token_logits, dim=-1)
             next_token_id = torch.multinomial(probs, num_samples=1)
-
-            input_ids = torch.cat([input_ids, next_token_id], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones((1,1), device=device, dtype=torch.long)], dim=1)
 
             if tokenizer.eos_token_id is not None and next_token_id.item() == tokenizer.eos_token_id:
                 break
 
+            input_ids = torch.cat([input_ids, next_token_id], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones((1,1), device=device, dtype=torch.long)], dim=1)
+
     full_response = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    # Extract just the answer part
-    answer_start = full_response.find("Answer:") + 7
-    if answer_start > 6:  # Found "Answer:"
-        answer = full_response[answer_start:].strip()
-        # Remove the question part if it got repeated
-        question_end = full_response.find("Answer:")
-        if question_end > 0:
-            answer = full_response[question_end+7:].strip()
+    answer_start = full_response.find("Answer:")
+    if answer_start != -1:
+        answer = full_response[answer_start + 7:].strip()
     else:
         answer = full_response.replace(prompt, "").strip()
     
