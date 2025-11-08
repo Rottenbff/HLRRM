@@ -5,6 +5,8 @@ Adapted for conversational question-answering tasks
 
 import os, shutil, pathlib, random, json, datetime, math
 import argparse
+import signal
+import sys
 from typing import Optional
 from dataclasses import dataclass
 
@@ -26,7 +28,6 @@ import wandb
 # Training Parameters
 HF_REPO_ID = "HLRRM-Dolly-QA"  # Change this to your HuggingFace repo
 SEED = 42
-NUM_EPOCHS = 3
 BLOCK_SIZE = 512
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 4 # Effective batch size = 8 * 4 = 32
@@ -34,7 +35,7 @@ LEARNING_RATE_MAX = 2e-4
 LEARNING_RATE_MIN = 1e-6
 WEIGHT_DECAY = 0.01
 MIXED_PRECISION = True
-EARLY_STOPPING_PATIENCE = 2 # Stop if validation loss doesn't improve for 2 epochs
+EARLY_STOPPING_PATIENCE = 2 # Early stopping when validation loss doesn't improve (for monitoring)
 
 # HLRRM Model Hyperparameters
 MODEL_CONFIG = {"d_model": 512, "n_heads": 8, "d_ff": 2048, "dropout": 0.1}
@@ -61,6 +62,18 @@ args = parser.parse_args()
 if args.disable_wandb:
     DISABLE_WANDB = True
     print("W&B logging disabled by command line argument.")
+
+# ----------------------------
+# Signal handler for graceful exit
+training_interrupted = False
+
+def signal_handler(sig, frame):
+    global training_interrupted
+    print("\nReceived interrupt signal (Ctrl+C). Saving current state...")
+    training_interrupted = True
+
+signal.signal(signal.SIGINT, signal_handler)
+print("Training will run indefinitely. Press Ctrl+C to stop gracefully.")
 
 # ----------------------------
 # Utilities & Initialization
@@ -214,8 +227,8 @@ if os.path.exists(LOCAL_CHECKPOINT_PATH):
 
 steps_per_epoch = len(train_loader) // GRAD_ACCUM_STEPS
 
-num_training_steps = NUM_EPOCHS * steps_per_epoch
-scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps, eta_min=LEARNING_RATE_MIN)
+# Use a very large number for scheduler since we train indefinitely
+scheduler = CosineAnnealingLR(optimizer, T_max=1000000, eta_min=LEARNING_RATE_MIN)
 
 scaler = torch.cuda.amp.GradScaler(enabled=(MIXED_PRECISION and device.type == "cuda"))
 
@@ -227,8 +240,10 @@ if not DISABLE_WANDB:
 
 best_val_loss = float('inf')
 patience_counter = 0
+epoch = start_epoch
 
-for epoch in range(start_epoch, NUM_EPOCHS):
+# Training continues indefinitely - use Ctrl+C to stop
+while True:
     model.train()
     # Update ponder weight for this epoch
     current_ponder_weight = PONDER_WEIGHT * (PONDER_WEIGHT_DECAY ** epoch)
@@ -408,11 +423,25 @@ Answer: [model generates response]
             print(f"Upload failed: {e}")
 
     if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"Early stopping triggered after {epoch+1} epochs.")
+        print(f"Early stopping patience reached. Continuing training (patience reset).")
+        patience_counter = 0  # Reset patience but continue training
+    
+    # Check for interrupt signal
+    if training_interrupted:
+        print(f"\nSaving final state at epoch {epoch}...")
+        torch.save({"epoch": epoch, "optimizer_state_dict": optimizer.state_dict(), "global_step": global_step}, LOCAL_CHECKPOINT_PATH)
         break
+    
+    epoch += 1  # Move to next epoch
 
 if not DISABLE_WANDB:
     wandb.finish()
+    
+if training_interrupted:
+    print(f"Training interrupted gracefully at epoch {epoch}. State saved.")
+else:
+    print("Training completed or interrupted.")
+
 print("Training run finished.")
 
 # ----------------------------
