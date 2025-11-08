@@ -4,6 +4,7 @@ Adapted for conversational question-answering tasks
 """
 
 import os, shutil, pathlib, random, json, datetime, math
+import argparse
 from typing import Optional
 from dataclasses import dataclass
 
@@ -49,6 +50,17 @@ BEST_MODEL_PATH = "best_model_dolly.bin"
 
 WANDB_PROJECT = "HLRRM-Dolly-QA"
 UPDATE_README = True
+DISABLE_WANDB = False  # Set to True to disable W&B logging
+
+# ----------------------------
+# Command Line Arguments
+parser = argparse.ArgumentParser(description="Train HLRRM model on Dolly Q&A dataset")
+parser.add_argument("--disable-wandb", action="store_true", help="Disable W&B logging")
+args = parser.parse_args()
+
+if args.disable_wandb:
+    DISABLE_WANDB = True
+    print("W&B logging disabled by command line argument.")
 
 # ----------------------------
 # Utilities & Initialization
@@ -209,8 +221,9 @@ scaler = torch.cuda.amp.GradScaler(enabled=(MIXED_PRECISION and device.type == "
 
 # ----------------------------
 # Training Loop
-wandb.init(project=WANDB_PROJECT, config=config, name=f"run-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}")
-wandb.watch(model, log="all", log_freq=steps_per_epoch)
+if not DISABLE_WANDB:
+    wandb.init(project=WANDB_PROJECT, config=config, name=f"run-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}")
+    wandb.watch(model, log="all", log_freq=steps_per_epoch)
 
 best_val_loss = float('inf')
 patience_counter = 0
@@ -252,14 +265,15 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             scheduler.step()
             global_step += 1
 
-            wandb.log({
-                "train/step_loss": loss.item(),
-                "train/lm_loss": lm_loss.item(),
-                "train/ponder_loss": ponder_loss.item(),
-                "train/learning_rate": scheduler.get_last_lr()[0],
-                "train/grad_norm": grad_norm.item(),
-                "global_step": global_step,
-            })
+            if not DISABLE_WANDB:
+                wandb.log({
+                    "train/step_loss": loss.item(),
+                    "train/lm_loss": lm_loss.item(),
+                    "train/ponder_loss": ponder_loss.item(),
+                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "train/grad_norm": grad_norm.item(),
+                    "global_step": global_step,
+                })
 
             # Save checkpoint every 10 epochs
             if epoch > 0 and epoch % 10 == 0:
@@ -309,7 +323,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     avg_val_loss = total_val_loss / max(1, len(val_loader))
     val_perplexity = torch.exp(torch.tensor(avg_val_loss))
     print(f"\nEpoch {epoch} | Validation Loss: {avg_val_loss:.4f} | Validation Perplexity: {val_perplexity:.2f}")
-    wandb.log({"epoch": epoch, "val/loss": avg_val_loss, "val/perplexity": val_perplexity})
+    if not DISABLE_WANDB:
+        wandb.log({"epoch": epoch, "val/loss": avg_val_loss, "val/perplexity": val_perplexity})
 
     # Save Model & Check for Early Stopping
     if avg_val_loss < best_val_loss:
@@ -396,7 +411,8 @@ Answer: [model generates response]
         print(f"Early stopping triggered after {epoch+1} epochs.")
         break
 
-wandb.finish()
+if not DISABLE_WANDB:
+    wandb.finish()
 print("Training run finished.")
 
 # ----------------------------
