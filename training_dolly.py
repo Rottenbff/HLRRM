@@ -35,8 +35,6 @@ WEIGHT_DECAY = 0.01
 MIXED_PRECISION = True
 EARLY_STOPPING_PATIENCE = 2 # Stop if validation loss doesn't improve for 2 epochs
 
-SAVE_STEPS = 500  # Save a checkpoint every 500 global steps
-
 # HLRRM Model Hyperparameters
 MODEL_CONFIG = {"d_model": 512, "n_heads": 8, "d_ff": 2048, "dropout": 0.1}
 MAX_HALT_STEPS = 8
@@ -263,33 +261,36 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 "global_step": global_step,
             })
 
-            if global_step > 0 and global_step % SAVE_STEPS == 0:
-                print(f"\nSaving checkpoint at global_step {global_step}")
+            # Save checkpoint every 10 epochs
+            if epoch > 0 and epoch % 10 == 0:
+                print(f"\nSaving checkpoint at epoch {epoch}")
                 # Save model weights
-                torch.save(model.state_dict(), LOCAL_WEIGHTS_PATH)
+                checkpoint_path = f"checkpoint_epoch_{epoch}.bin"
+                torch.save(model.state_dict(), checkpoint_path)
                 # Save full training state
-                torch.save({
+                checkpoint_state = {
                     "epoch": epoch,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "global_step": global_step
-                }, LOCAL_CHECKPOINT_PATH)
+                }
+                torch.save(checkpoint_state, f"checkpoint_state_epoch_{epoch}.pt")
 
                 # Upload to HuggingFace Hub if configured
                 if HF_TOKEN and HF_REPO_ID:
                     try:
                         api = HfApi()
-                        commit_msg = f"Checkpoint at step {global_step} (Epoch {epoch})"
+                        commit_msg = f"Checkpoint at epoch {epoch}"
                         api.upload_file(
-                            path_or_fileobj=LOCAL_WEIGHTS_PATH,
-                            path_in_repo=LOCAL_WEIGHTS_PATH,
+                            path_or_fileobj=checkpoint_path,
+                            path_in_repo=f"checkpoint_epoch_{epoch}.bin",
                             repo_id=HF_REPO_ID,
                             repo_type="model",
                             commit_message=commit_msg,
                             token=HF_TOKEN
                         )
-                        print(f"Uploaded checkpoint {global_step} to {HF_REPO_ID}")
+                        print(f"Uploaded checkpoint epoch {epoch} to {HF_REPO_ID}")
                     except Exception as e:
-                        print(f"Upload failed for checkpoint {global_step}: {e}")
+                        print(f"Upload failed for checkpoint epoch {epoch}: {e}")
 
         progress.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
 
